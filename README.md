@@ -50,7 +50,7 @@ head -c 16 /dev/urandom | xxd -ps
 ```
 ... where:
 - `<fake-tls domain>` is a domain name you would like to fake, in this way, blocking methods based on sni sniffing can be defended during tls handshake. This option is optional, if have set, the secret field of the client needs in a special format.
-- `nobody` is the username. `mtproto-proxy` calls `setuid()` to drop privilegies.
+- `nobody` is the username. `mtproto-proxy` calls `setuid()` to drop privileges.
 - `443` is the port, used by clients to connect to the proxy.
 - `8888` is the local port. You can use it to get statistics from `mtproto-proxy`. Like `wget localhost:8888/stats`. You can only get this stat via loopback.
 - `<secret>` is the secret generated at step 3. Also you can set multiple secrets: `-S <secret1> -S <secret2>`.
