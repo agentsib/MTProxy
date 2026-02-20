@@ -124,6 +124,26 @@ systemctl status MTProxy.service
 systemctl enable MTProxy.service
 ```
 
+## Linux optimization
+
+```bash
+cat <<EOF > /etc/sysctl.d/99-mtproxy.conf
+net.core.somaxconn = 65535
+net.ipv4.tcp_max_syn_backlog = 8192
+net.ipv4.ip_local_port_range = 10240 65535
+net.ipv4.tcp_fin_timeout = 15
+net.ipv4.tcp_tw_reuse = 1
+fs.file-max = 1000000
+EOF
+
+sysctl --system
+
+ulimit -n 1048576
+
+```
+
+
+
 ## Docker image
 Telegram is also providing [official Docker image](https://hub.docker.com/r/telegrammessenger/proxy/).
 Note: the image is outdated.
