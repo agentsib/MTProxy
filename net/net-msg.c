@@ -516,7 +516,13 @@ int rwm_push_data_front (struct raw_message *raw, const void *data, int alloc_by
   }
   while (alloc_bytes) {
     struct msg_buffer *X = alloc_msg_buffer (raw->first ? raw->first->part : 0, alloc_bytes >= MSG_SMALL_BUFFER ? MSG_STD_BUFFER : MSG_SMALL_BUFFER);
-    assert (X);
+    if (!X) {
+      // message buffer pool exhausted: return the number of bytes actually prepended (< requested).
+      // A short front prepend leaves the message missing its leading bytes, so callers must treat any
+      // shortfall as a failure rather than send a truncated packet.
+      if (locked) { locked->magic = MSG_PART_MAGIC; }
+      return r - alloc_bytes;
+    }
     int size = X->chunk->buffer_size;
     mp = new_msg_part (raw->first, X);
     mp->next = raw->first;
@@ -574,7 +580,9 @@ void *rwm_prepend_alloc (struct raw_message *raw, int alloc_bytes) /* {{{ */ {
   // struct msg_part *mp, *mpl;
   // int res = 0;
   if (!raw->first) {
-    rwm_push_data (raw, 0, alloc_bytes);
+    if (rwm_push_data (raw, 0, alloc_bytes) != alloc_bytes) {
+      return 0;
+    }
     assert (raw->first == raw->last);
     assert (raw->total_bytes == alloc_bytes);
     return raw->first->part->data + raw->first_offset;
@@ -593,7 +601,10 @@ void *rwm_prepend_alloc (struct raw_message *raw, int alloc_bytes) /* {{{ */ {
 
   assert (raw->first_offset == raw->first->offset);
   struct msg_buffer *X = alloc_msg_buffer (raw->first ? raw->first->part : 0, alloc_bytes);
-  assert (X);  
+  if (!X) {
+    if (locked) { locked->magic = MSG_PART_MAGIC; }
+    return 0;
+  }
   int size = X->chunk->buffer_size;
   assert (size >= alloc_bytes);
   struct msg_part *mp = new_msg_part (raw->first, X);
@@ -617,7 +628,9 @@ void *rwm_postpone_alloc (struct raw_message *raw, int alloc_bytes) /* {{{ */ {
   // struct msg_part *mp, *mpl;
   // int res = 0;
   if (!raw->first) {
-    rwm_push_data (raw, 0, alloc_bytes);
+    if (rwm_push_data (raw, 0, alloc_bytes) != alloc_bytes) {
+      return 0;
+    }
     assert (raw->first == raw->last);
     assert (raw->total_bytes == alloc_bytes);
     return raw->first->part->data + raw->first_offset;
@@ -635,7 +648,10 @@ void *rwm_postpone_alloc (struct raw_message *raw, int alloc_bytes) /* {{{ */ {
     return mp->part->data + mp->data_end - alloc_bytes;
   }
   struct msg_buffer *X = alloc_msg_buffer (mp->part, alloc_bytes);
-  assert (X);
+  if (!X) {
+    if (locked) { locked->magic = MSG_PART_MAGIC; }
+    return 0;
+  }
   size = X->chunk->buffer_size;
   assert (size >= alloc_bytes);
   
@@ -1238,7 +1254,9 @@ int rwm_process_encrypt_decrypt (struct rwm_encrypt_decrypt_tmp *x, const void *
   struct raw_message *res = x->raw;
   if (!x->buf_left) {
     struct msg_buffer *X = alloc_msg_buffer (res->last->part, x->left >= MSG_STD_BUFFER ? MSG_STD_BUFFER : x->left);
-    assert (X);
+    if (!X) {
+      return -1;
+    }
     struct msg_part *mp = new_msg_part (res->last, X);
     res->last->next = mp;
     res->last = mp;
@@ -1268,7 +1286,10 @@ int rwm_process_encrypt_decrypt (struct rwm_encrypt_decrypt_tmp *x, const void *
         res->last->data_end += t;
       
         struct msg_buffer *X = alloc_msg_buffer (res->last->part, x->left + len + bsize >= MSG_STD_BUFFER ? MSG_STD_BUFFER : x->left + len + bsize);
-        assert (X);
+        if (!X) {
+          res->last->data_end -= t;
+          return -1;
+        }
         struct msg_part *mp = new_msg_part (res->last, X);
         res->last->next = mp;
         res->last = mp;
@@ -1300,7 +1321,9 @@ int rwm_process_encrypt_decrypt (struct rwm_encrypt_decrypt_tmp *x, const void *
   while (1) {
     if (x->buf_left < bsize) {
       struct msg_buffer *X = alloc_msg_buffer (res->last->part, x->left + len >= MSG_STD_BUFFER ? MSG_STD_BUFFER : x->left + len);
-      assert (X);
+      if (!X) {
+        return -1;
+      }
       struct msg_part *mp = new_msg_part (res->last, X);
       res->last->next = mp;
       res->last = mp;
@@ -1348,7 +1371,12 @@ int rwm_encrypt_decrypt_to (struct raw_message *raw, struct raw_message *res, in
   if (!res->last || res->last->part->refcnt != 1) {
     int l = res->last ? bytes : bytes + RM_PREPEND_RESERVE;
     struct msg_buffer *X = alloc_msg_buffer (res->last ? res->last->part : 0, l >= MSG_STD_BUFFER ? MSG_STD_BUFFER : l);
-    assert (X);
+    if (!X) {
+      if (locked) {
+        locked->magic = MSG_PART_MAGIC;
+      }
+      return -1;
+    }
     struct msg_part *mp = new_msg_part (res->last, X);
     if (res->last) {
       res->last->next = mp;

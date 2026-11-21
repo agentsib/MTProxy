@@ -64,16 +64,28 @@ int cpu_tcp_server_writer (connection_job_t C) /* {{{ */ {
     struct raw_message *raw = mpq_pop_nw (c->out_queue, 4);
     if (!raw) { break; }
     //rwm_union (out, raw);
-    c->type->write_packet (C, raw);
+    int wp = c->type->write_packet (C, raw);
     free (raw);
+    if (wp < 0) {
+      // write_packet already failed the connection (message buffer pool exhausted); return now so we
+      // neither flush/encrypt (which would fail again and double-count) nor send partial output
+      return 0;
+    }
   }
   
-  c->type->flush (C);
+  if (c->type->flush (C) < 0) {
+    // flush failed the connection while padding the output; don't encrypt or send
+    return 0;
+  }
 
   struct raw_message *raw = malloc (sizeof (*raw));
 
   if (c->type->crypto_encrypt_output && c->crypto) {
-    c->type->crypto_encrypt_output (C);
+    if (c->type->crypto_encrypt_output (C) < 0) {
+      // the output couldn't be encrypted and the connection was failed, don't send partially encrypted data
+      free (raw);
+      return 0;
+    }
     *raw = c->out_p;
     rwm_init (&c->out_p, 0);
   } else {
@@ -81,7 +93,11 @@ int cpu_tcp_server_writer (connection_job_t C) /* {{{ */ {
     rwm_init (&c->out, 0);
   }
  
+  // socket-side bytes already queued, plus the batch we are about to hand off (the socket has not
+  // merged it into its out yet), so a connection's most recent burst is not missed
+  int queued_socket_out = c->io_conn ? SOCKET_CONN_INFO(c->io_conn)->out.total_bytes : 0;
   if (raw->total_bytes && c->io_conn) {        
+    queued_socket_out += raw->total_bytes;
     mpq_push_w (SOCKET_CONN_INFO(c->io_conn)->out_packet_queue, raw, 0);
     if (stop) {
       __sync_fetch_and_or (&SOCKET_CONN_INFO(c->io_conn)->flags, C_STOPWRITE);
@@ -91,6 +107,12 @@ int cpu_tcp_server_writer (connection_job_t C) /* {{{ */ {
     rwm_free (raw);
     free (raw);
   }
+
+  // publish the socket-side queued byte count for check_all_conn_buffers(), from the connection's own
+  // job where c->io_conn is guaranteed alive (its reference is only passed away by this connection's
+  // own close). The reclaimer must not dereference the socket itself: holding the connection does not
+  // keep its socket connection alive.
+  __atomic_store_n (&c->queued_socket_out_bytes, queued_socket_out, __ATOMIC_RELAXED);
 
   return 0;
 }
@@ -201,7 +223,10 @@ int cpu_tcp_aes_crypto_encrypt_output (connection_job_t C) /* {{{ */ {
   int l = out->total_bytes;
   l &= ~15;
   if (l) {
-    assert (rwm_encrypt_decrypt_to (&c->out, &c->out_p, l, T->write_aeskey, 16) == l);
+    if (rwm_encrypt_decrypt_to (&c->out, &c->out_p, l, T->write_aeskey, 16) != l) {
+      fail_connection_no_buffers (C);
+      return -1;
+    }
   }
 
   return (-out->total_bytes) & 15;
@@ -218,7 +243,10 @@ int cpu_tcp_aes_crypto_decrypt_input (connection_job_t C) /* {{{ */ {
   int l = in->total_bytes;
   l &= ~15;
   if (l) {
-    assert (rwm_encrypt_decrypt_to (&c->in_u, &c->in, l, T->read_aeskey, 16) == l);
+    if (rwm_encrypt_decrypt_to (&c->in_u, &c->in, l, T->read_aeskey, 16) != l) {
+      fail_connection_no_buffers (C);
+      return 0;
+    }
   }
 
   return (-in->total_bytes) & 15;
@@ -249,11 +277,17 @@ int cpu_tcp_aes_crypto_ctr128_encrypt_output (connection_job_t C) /* {{{ */ {
       }
 
       unsigned char header[5] = {0x17, 0x03, 0x03, len >> 8, len & 255};
-      rwm_push_data (&c->out_p, header, 5);
+      if (rwm_push_data (&c->out_p, header, 5) != 5) {
+        fail_connection_no_buffers (C);
+        return -1;
+      }
       vkprintf (2, "Send TLS-packet of length %d\n", len);
     }
 
-    assert (rwm_encrypt_decrypt_to (&c->out, &c->out_p, len, T->write_aeskey, 1) == len);
+    if (rwm_encrypt_decrypt_to (&c->out, &c->out_p, len, T->write_aeskey, 1) != len) {
+      fail_connection_no_buffers (C);
+      return -1;
+    }
   }
 
   return 0;
@@ -295,7 +329,10 @@ int cpu_tcp_aes_crypto_ctr128_decrypt_input (connection_job_t C) /* {{{ */ {
       c->left_tls_packet_length -= len;
     }
     vkprintf (2, "Read %d bytes out of %d available\n", len, c->in_u.total_bytes);
-    assert (rwm_encrypt_decrypt_to (&c->in_u, &c->in, len, T->read_aeskey, 1) == len);
+    if (rwm_encrypt_decrypt_to (&c->in_u, &c->in, len, T->read_aeskey, 1) != len) {
+      fail_connection_no_buffers (C);
+      return 0;
+    }
   }
 
   return 0;

@@ -228,6 +228,7 @@ struct connection_info {
   int error;
   int unread_res_bytes;
   int skip_bytes;
+  int queued_socket_out_bytes; // bytes queued on this connection's socket out, published by its own writer job and read by check_all_conn_buffers() without touching the socket
   int pending_queries;
   int queries_ok;
   char custom_data[CONN_CUSTOM_DATA_BYTES];
@@ -320,6 +321,7 @@ struct connections_stat {
   long long accept_rate_limit_failed;
   long long accept_init_accepted_failed;
   long long accept_connection_limit_failed;
+  long long connections_failed_no_buffers;
 };
 
 #define QUERY_INFO(_c) ((struct query_info *)(_c)->j_custom)
@@ -347,6 +349,8 @@ int clear_connection_timeout (connection_job_t C);
   
 int prepare_stats (char *buf, int size);
 void fail_connection (connection_job_t C, int who);
+void fail_connection_no_buffers (connection_job_t C); // closes the connection, because the message buffer pool is exhausted
+extern void (*connections_no_buffers_callback) (void); // if set, invoked by fail_connection_no_buffers from any thread, so that the application can free buffers
 void fail_socket_connection (socket_connection_job_t C, int who);
 
 

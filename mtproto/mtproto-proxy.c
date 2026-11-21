@@ -491,6 +491,7 @@ static inline void add_stats (struct worker_stats *W) {
   UPD (conn.accept_nonblock_set_failed);
   UPD (conn.accept_rate_limit_failed);
   UPD (conn.accept_init_accepted_failed);
+  UPD (conn.connections_failed_no_buffers);
 
   UPD (allocated_aes_crypto); 
   UPD (allocated_aes_crypto_temp); 
@@ -627,6 +628,7 @@ void mtfront_prepare_stats (stats_buffer_t *sb) {
 	     "total_special_connections\t%d\n"
 	     "total_max_special_connections\t%d\n"
 	     "total_accept_connections_failed\t%lld %lld %lld %lld %lld\n"
+	     "total_connections_failed_no_buffers\t%lld\n"
 	     "ext_connections\t%lld\n"
 	     "ext_connections_created\t%lld\n"
 	     "total_active_network_events\t%d\n"
@@ -693,6 +695,7 @@ void mtfront_prepare_stats (stats_buffer_t *sb) {
 	     S(conn.accept_connection_limit_failed),
 	     S(conn.accept_rate_limit_failed),
 	     S(conn.accept_nonblock_set_failed),
+	     S(conn.connections_failed_no_buffers),
 	     S(ext_connections),
 	     S(ext_connections_created),
 	     S(ev_heap_size),
@@ -792,31 +795,55 @@ void push_rpc_confirmation (JOB_REF_ARG (C), int confirm) {
 
   if ((lrand48_j() & 1) || !(TCP_RPC_DATA(C)->flags & RPC_F_PAD)) {
     struct raw_message *msg = malloc (sizeof (struct raw_message));
-    rwm_create (msg, "\xdd", 1);
-    rwm_push_data (msg, &confirm, 4);
+    if (rwm_create (msg, "\xdd", 1) != 1 || rwm_push_data (msg, &confirm, 4) != 4) {
+      rwm_free (msg);
+      free (msg);
+      fail_connection_no_buffers (C);
+      job_signal (JOB_REF_PASS (C), JS_RUN);
+      return;
+    }
     mpq_push_w (CONN_INFO(C)->out_queue, msg, 0);
     job_signal (JOB_REF_PASS (C), JS_RUN);
   } else {
     int x = -1;
     struct raw_message m;
-    assert (rwm_create (&m, &x, 4) == 4);
-    assert (rwm_push_data (&m, &confirm, 4) == 4);
+    if (rwm_create (&m, &x, 4) != 4 || rwm_push_data (&m, &confirm, 4) != 4) {
+      rwm_free (&m);
+      fail_connection_no_buffers (C);
+      job_signal (JOB_REF_PASS (C), JS_RUN);
+      return;
+    }
 
     int z = lrand48_j() & 1;
     while (z-- > 0) {
       int t = lrand48_j();
-      assert (rwm_push_data (&m, &t, 4) == 4);
+      if (rwm_push_data (&m, &t, 4) != 4) {
+        rwm_free (&m);
+        fail_connection_no_buffers (C);
+        job_signal (JOB_REF_PASS (C), JS_RUN);
+        return;
+      }
     }
 
     tcp_rpc_conn_send (JOB_REF_CREATE_PASS (C), &m, 0);
 
     x = 0;
-    assert (rwm_create (&m, &x, 4) == 4);
+    if (rwm_create (&m, &x, 4) != 4) {
+      rwm_free (&m);
+      fail_connection_no_buffers (C);
+      job_signal (JOB_REF_PASS (C), JS_RUN);
+      return;
+    }
 
     z = lrand48_j() & 1;
     while (z-- > 0) {
       int t = lrand48_j();
-      assert (rwm_push_data (&m, &t, 4) == 4);
+      if (rwm_push_data (&m, &t, 4) != 4) {
+        rwm_free (&m);
+        fail_connection_no_buffers (C);
+        job_signal (JOB_REF_PASS (C), JS_RUN);
+        return;
+      }
     }
 
     tcp_rpc_conn_send (JOB_REF_PASS (C), &m, 0);
@@ -1789,6 +1816,7 @@ int forward_tcp_query (struct tl_in_state *tlio_in, connection_job_t c, conn_tar
     flags |= 8;
   }
 
+  int tls_res;
   TLS_START (JOB_REF_PASS (d)); // open tlio_out context
 
   tl_store_int (RPC_PROXY_REQ);
@@ -1840,7 +1868,15 @@ int forward_tcp_query (struct tl_in_state *tlio_in, connection_job_t c, conn_tar
   int len = TL_IN_REMAINING;
   assert (tl_copy_through (tlio_in, tlio_out, len, 1) == len);
 
-  TLS_END;   // close tlio_out context
+  tls_res = tl_store_end_ext (0);
+  tls_pop ();   // close tlio_out context
+  if (tls_res < 0) {
+    // the request could not be serialized because the message buffer pool was exhausted. It was dropped
+    // before being queued, so the shared middle-end stream is not desynced and must not be closed; fail
+    // the originating client connection instead.
+    fail_connection_no_buffers (c);
+    return 0;
+  }
 
   if (CONN_INFO(c)->type == &ct_http_server_mtfront) {
     assert (CONN_INFO(c)->pending_queries >= 0);
@@ -1906,7 +1942,10 @@ void lru_insert_conn (connection_job_t c) {
   }
 }
 
+static double last_reclaim_buffers_time;
+
 void check_all_conn_buffers (void) {
+  last_reclaim_buffers_time = precise_now;
   struct buffers_stat bufs;
   fetch_buffers_stat (&bufs);
   long long max_buffer_memory = bufs.max_buffer_chunks * (long long) MSG_BUFFERS_CHUNK_SIZE;
@@ -1917,12 +1956,51 @@ void check_all_conn_buffers (void) {
     connection_job_t d = connection_get_by_fd_generation (Ext->in_fd, Ext->in_gen);
     if (d) {
       int tot_used_bytes = CONN_INFO(d)->in.total_bytes + CONN_INFO(d)->in_u.total_bytes + CONN_INFO(d)->out.total_bytes + CONN_INFO(d)->out_p.total_bytes;
+      // the connection's queued output is encrypted and moved to its socket connection's out; count it
+      // too, otherwise the estimate reads ~0 and the loop empties the whole eviction list. The value is
+      // published by the connection's own writer job; we must not dereference the socket here, because
+      // holding d does not keep its socket connection alive.
+      tot_used_bytes += __atomic_load_n (&CONN_INFO(d)->queued_socket_out_bytes, __ATOMIC_RELAXED);
       to_free -= tot_used_bytes * 2;
       fail_connection (d, -500);
       job_decref (JOB_REF_PASS (d));
     }
     lru_delete_ext_conn (Ext);
     ++connections_failed_lru;
+  }
+}
+
+// check_all_conn_buffers() is normally run once per second from cron(), which leaves up to a second during which
+// every connection that receives data is closed by fail_connection_no_buffers(), while the connections holding
+// the buffers are untouched. So when the pool is found exhausted, run it from a JC_ENGINE job right away (cron()
+// itself runs in that class, so ConnLRU is accessed from the same class). A burst of failures schedules it once.
+static int reclaim_buffers_scheduled;
+
+// The closed connections free their buffers asynchronously, so an immediate rerun would see the same
+// usage and evict another whole batch. Run the on-demand reclaim at most once per this interval;
+// cron() and the recv-side shedding remain as backstops.
+#define MIN_RECLAIM_BUFFERS_INTERVAL 0.1
+
+static int reclaim_buffers_job_run (job_t job, int op, struct job_thread *JT) {
+  switch (op) {
+  case JS_RUN:
+    __sync_bool_compare_and_swap (&reclaim_buffers_scheduled, 1, 0);
+    if (precise_now - last_reclaim_buffers_time >= MIN_RECLAIM_BUFFERS_INTERVAL) {
+      check_all_conn_buffers ();
+    }
+    return JOB_COMPLETED;
+  case JS_FINISH:
+    assert (job->j_refcnt == 1);
+    return job_free (JOB_REF_PASS (job));
+  default:
+    assert (0);
+  }
+}
+
+static void schedule_buffers_reclaim (void) {
+  if (__sync_bool_compare_and_swap (&reclaim_buffers_scheduled, 0, 1)) {
+    job_t job = create_async_job (reclaim_buffers_job_run, JSC_ALLOW (JC_ENGINE, JS_RUN) | JSIG_FAST (JS_FINISH), -1, 0, 0, JOB_REF_NULL);
+    schedule_job (JOB_REF_PASS (job));
   }
 }
 
@@ -1950,6 +2028,7 @@ int mtfront_data_sent (connection_job_t c, int bytes_sent) {
 }
 
 void init_ct_server_mtfront (void) {
+  connections_no_buffers_callback = schedule_buffers_reclaim;
   assert (check_conn_functions (&ct_http_server, 1) >= 0);
   memcpy (&ct_http_server_mtfront, &ct_http_server, sizeof (conn_type_t));
   memcpy (&ct_tcp_rpc_ext_server_mtfront, &ct_tcp_rpc_ext_server, sizeof (conn_type_t));
@@ -2097,7 +2176,7 @@ void mtfront_pre_loop (void) {
       if (window_clamp) {
         listening_connection_job_t LC = Events[http_sfd[i]].data;
         assert (LC);
-        CONN_INFO(LC)->window_clamp = window_clamp;
+        LISTEN_CONN_INFO(LC)->window_clamp = window_clamp;
         if (setsockopt (http_sfd[i], IPPROTO_TCP, TCP_WINDOW_CLAMP, &window_clamp, 4) < 0) {
           vkprintf (0, "error while setting window size for socket #%d to %d: %m\n", http_sfd[i], window_clamp);
         }

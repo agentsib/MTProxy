@@ -91,6 +91,8 @@ conn_type_t ct_tcp_rpc_ext_server = {
 int tcp_proxy_pass_parse_execute (connection_job_t C);
 int tcp_proxy_pass_close (connection_job_t C, int who);
 int tcp_proxy_pass_connected (connection_job_t C);
+int tcp_proxy_pass_flush (connection_job_t C);
+int tcp_proxy_pass_alarm (connection_job_t C);
 int tcp_proxy_pass_write_packet (connection_job_t c, struct raw_message *raw); 
 
 conn_type_t ct_proxy_pass = {
@@ -102,8 +104,86 @@ conn_type_t ct_proxy_pass = {
   .connected = tcp_proxy_pass_connected,
   .close = tcp_proxy_pass_close,
   .write_packet = tcp_proxy_pass_write_packet,
+  .flush = tcp_proxy_pass_flush,
+  .alarm = tcp_proxy_pass_alarm,
   .connected = server_noop,
 };
+
+/*
+ * Backpressure for proxy pass connections.
+ *
+ * Each side of the relay publishes the number of bytes queued for its own socket but not yet written to it
+ * (tcp_proxy_pass_flush, invoked from the NET-CPU job of that connection). The other side checks this value
+ * whenever it has received data to relay: if the peer has fallen too far behind, the connection stops reading
+ * from its own socket (C_STOPREAD on its socket connection, so that the kernel buffer fills up and TCP flow
+ * control reaches the remote side) and polls the peer with its job timer until the peer has caught up.
+ *
+ * The state is accessed only from the connection's own job or through the peer connection, which is kept
+ * alive by the reference in proxy_pass_data.peer; the socket connection is accessed only through the connection's own
+ * c->io_conn, in the same way as cpu_tcp_server_writer does.
+ */
+#define PROXY_PASS_MAX_PENDING_BYTES (256 << 10)
+#define PROXY_PASS_RESUME_PENDING_BYTES (64 << 10)
+#define PROXY_PASS_POLL_INTERVAL 0.1
+
+struct proxy_pass_data {
+  job_t peer; // the other side of the relay, holds a reference to it; set only in proxy_connection, cleared only in tcp_proxy_pass_close
+  int read_paused; // C_STOPREAD was set on the own socket connection, because the peer's output was backed up
+  int pending_out_bytes; // bytes queued for the own socket but not yet written to it, updated by tcp_proxy_pass_flush and read by the peer's job
+};
+
+#define PROXY_PASS_DATA(C) ((struct proxy_pass_data *)(CONN_INFO(C)->custom_data))
+
+static int tcp_proxy_pass_peer_pending_bytes (connection_job_t C) {
+  job_t E = PROXY_PASS_DATA(C)->peer;
+  return E ? __atomic_load_n (&PROXY_PASS_DATA(E)->pending_out_bytes, __ATOMIC_RELAXED) : 0;
+}
+
+// NET-CPU context, invoked by cpu_tcp_server_writer right before the contents of c->out are passed to the socket connection
+int tcp_proxy_pass_flush (connection_job_t C) {
+  struct connection_info *c = CONN_INFO(C);
+  int pending = c->out.total_bytes;
+  if (c->io_conn) {
+    pending += SOCKET_CONN_INFO(c->io_conn)->out.total_bytes;
+  }
+  __atomic_store_n (&PROXY_PASS_DATA(C)->pending_out_bytes, pending, __ATOMIC_RELAXED);
+  return 0;
+}
+
+static void tcp_proxy_pass_pause_read (connection_job_t C) {
+  struct connection_info *c = CONN_INFO(C);
+  if (!c->io_conn) {
+    return;
+  }
+  vkprintf (2, "proxy pass connection #%d: peer has %d pending output bytes, stop reading\n", c->fd, tcp_proxy_pass_peer_pending_bytes (C));
+  PROXY_PASS_DATA(C)->read_paused = 1;
+  __sync_fetch_and_or (&SOCKET_CONN_INFO(c->io_conn)->flags, C_STOPREAD);
+  job_timer_insert (C, precise_now + PROXY_PASS_POLL_INTERVAL);
+}
+
+int tcp_proxy_pass_alarm (connection_job_t C) {
+  struct connection_info *c = CONN_INFO(C);
+  struct proxy_pass_data *D = PROXY_PASS_DATA(C);
+  if (!D->read_paused) {
+    return 0; // the timer was armed before the connection became a proxy pass connection
+  }
+  if (!D->peer || !c->io_conn || c->status == conn_write_close) {
+    return 0;
+  }
+  int pending = tcp_proxy_pass_peer_pending_bytes (C);
+  if (pending < PROXY_PASS_RESUME_PENDING_BYTES) {
+    vkprintf (2, "proxy pass connection #%d: peer has %d pending output bytes, resume reading\n", c->fd, pending);
+    D->read_paused = 0;
+    __sync_fetch_and_and (&SOCKET_CONN_INFO(c->io_conn)->flags, ~C_STOPREAD);
+    // epoll is edge-triggered, so the socket connection must be run explicitly to read the data that is already available
+    job_signal (JOB_REF_CREATE_PASS (c->io_conn), JS_RUN);
+  } else {
+    // the peer updates pending_out_bytes only when its job runs, so run it and check again later
+    job_signal (JOB_REF_CREATE_PASS (D->peer), JS_RUN);
+    job_timer_insert (C, precise_now + PROXY_PASS_POLL_INTERVAL);
+  }
+  return 0;
+}
 
 int tcp_proxy_pass_connected (connection_job_t C) {
   struct connection_info *c = CONN_INFO(C);
@@ -113,11 +193,11 @@ int tcp_proxy_pass_connected (connection_job_t C) {
 
 int tcp_proxy_pass_parse_execute (connection_job_t C) {
   struct connection_info *c = CONN_INFO(C);
-  if (!c->extra) {
+  if (!PROXY_PASS_DATA(C)->peer) {
     fail_connection (C, -1);
     return 0;
   }
-  job_t E = job_incref (c->extra);
+  job_t E = job_incref (PROXY_PASS_DATA(C)->peer);
   struct connection_info *e = CONN_INFO(E);
 
   struct raw_message *r = malloc (sizeof (*r));
@@ -126,14 +206,19 @@ int tcp_proxy_pass_parse_execute (connection_job_t C) {
   vkprintf (3, "proxying %d bytes to %s:%d\n", r->total_bytes, show_remote_ip (E), e->remote_port);
   mpq_push_w (e->out_queue, PTR_MOVE(r), 0);
   job_signal (JOB_REF_PASS (E), JS_RUN);
+
+  if (!PROXY_PASS_DATA(C)->read_paused && tcp_proxy_pass_peer_pending_bytes (C) >= PROXY_PASS_MAX_PENDING_BYTES) {
+    tcp_proxy_pass_pause_read (C);
+  }
   return 0;
 }
 
 int tcp_proxy_pass_close (connection_job_t C, int who) {
   struct connection_info *c = CONN_INFO(C);
   vkprintf (1, "closing proxy pass connection #%d %s:%d -> %s:%d\n", c->fd, show_our_ip (C), c->our_port, show_remote_ip (C), c->remote_port);
-  if (c->extra) {
-    job_t E = PTR_MOVE (c->extra);
+  struct proxy_pass_data *D = PROXY_PASS_DATA(C);
+  if (D->peer) {
+    job_t E = PTR_MOVE (D->peer);
     fail_connection (E, -23);
     job_decref (JOB_REF_PASS (E));
   }
@@ -926,7 +1011,7 @@ static int is_allowed_timestamp (int timestamp) {
   // the allowed error must be big enough to allow requests after time synchronization
   const int MAX_ALLOWED_TIMESTAMP_ERROR = 10 * 60;
   if (timestamp > now - MAX_ALLOWED_TIMESTAMP_ERROR) {
-    // this can happen only first (MAX_ALLOWED_TIMESTAMP_ERROR + 3) sceonds after first_client_random->time
+    // this can happen only first (MAX_ALLOWED_TIMESTAMP_ERROR + 3) seconds after first_client_random->time
     vkprintf (1, "Allow recent request with timestamp %d without full check for client random duplication\n", timestamp);
     return 1;
   }
@@ -964,7 +1049,7 @@ static int proxy_connection (connection_job_t C, const struct domain_info *info)
 
   c->type->crypto_free (C);
   job_incref (C); 
-  job_t EJ = alloc_new_connection (cfd, NULL, NULL, ct_outbound, &ct_proxy_pass, C, ntohl (*(int *)&info->target.s_addr), (void *)info->target_ipv6, port); 
+  job_t EJ = alloc_new_connection (cfd, NULL, NULL, ct_outbound, &ct_proxy_pass, NULL, ntohl (*(int *)&info->target.s_addr), (void *)info->target_ipv6, port);
 
   if (!EJ) {
     kprintf ("failed to create proxy pass connection (2)");
@@ -974,7 +1059,11 @@ static int proxy_connection (connection_job_t C, const struct domain_info *info)
   }
 
   c->type = &ct_proxy_pass;
-  c->extra = job_incref (EJ);
+  memset (c->custom_data, 0, sizeof (c->custom_data)); // it held struct tcp_rpc_data, now it holds struct proxy_pass_data
+  // c->extra is left untouched: it still points to the tcp_rpc_server_functions of the original type, which may be used
+  // by a NEV_TCP_CONN_READY notification queued at accept time and delivered after the connection became a proxy pass one
+  PROXY_PASS_DATA(C)->peer = job_incref (EJ);
+  PROXY_PASS_DATA(EJ)->peer = C; // takes over the reference acquired by job_incref (C) above
       
   assert (CONN_INFO(EJ)->io_conn);
   unlock_job (JOB_REF_PASS (EJ));
@@ -985,10 +1074,14 @@ static int proxy_connection (connection_job_t C, const struct domain_info *info)
 int tcp_rpcs_ext_alarm (connection_job_t C) {
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
   if (D->in_packet_num == -3 && default_domain_info != NULL) {
-    return proxy_connection (C, default_domain_info);  
-  } else {
-    return 0;
+    return proxy_connection (C, default_domain_info);
   }
+  if (D->in_packet_num <= 0) {
+    struct connection_info *c = CONN_INFO (C);
+    vkprintf (1, "closing connection #%d from %s:%d: no complete packet received within the initial deadline\n", c->fd, show_remote_ip (C), c->remote_port);
+    fail_connection (C, -1);
+  }
+  return 0;
 }
 
 int tcp_rpcs_ext_init_accepted (connection_job_t C) {
@@ -1002,7 +1095,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
 
   struct tcp_rpc_data *D = TCP_RPC_DATA (C);
   if (D->crypto_flags & RPCF_COMPACT_OFF) {
-    if (D->in_packet_num != -3) {
+    if (D->in_packet_num > 0) {
       job_timer_remove (C);
     }
     return tcp_rpcs_parse_execute (C);
@@ -1014,7 +1107,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
   vkprintf (4, "%s. in_total_bytes = %d\n", __func__, c->in.total_bytes);
 
   while (1) {
-    if (D->in_packet_num != -3) {
+    if (D->in_packet_num > 0) {
       job_timer_remove (C);
     }
     if (c->flags & C_ERROR) {
@@ -1146,7 +1239,6 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           vkprintf (1, "Receive again request with the same client random\n");
           RETURN_TLS_ERROR(info);
         }
-        add_client_random (client_random);
         delete_old_client_randoms();
 
         unsigned char expected_random[32];
@@ -1161,6 +1253,11 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
           vkprintf (1, "Receive request with unmatched client random\n");
           RETURN_TLS_ERROR(info);
         }
+        // the request is authenticated: remember its client random before the timestamp check, so that a request
+        // rejected only because of its timestamp can't be repeated later, when its timestamp becomes acceptable.
+        // Requests with an unmatched client random are intentionally not remembered: they can't become valid
+        // without a restart, which empties the cache anyway, so remembering them would only let anyone grow it
+        add_client_random (client_random);
         int timestamp = *(int *)(expected_random + 28) ^ *(int *)(client_random + 28);
         if (!is_allowed_timestamp (timestamp)) {
           RETURN_TLS_ERROR(info);
@@ -1395,7 +1492,7 @@ int tcp_rpcs_compact_parse_execute (connection_job_t C) {
       packet_len <<= 2;
     }
 
-    if (packet_len <= 0 || (packet_len & 0xc0000000) || (!(D->flags & RPC_F_PAD) && (packet_len & 3))) {
+    if (packet_len < 4 || (packet_len & 0xc0000000) || (!(D->flags & RPC_F_PAD) && (packet_len & 3))) {
       vkprintf (1, "error while parsing packet: bad packet length %d\n", packet_len);
       fail_connection (C, -1);
       return 0;
